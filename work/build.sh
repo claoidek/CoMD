@@ -1,6 +1,6 @@
 #!/bin/bash
 
-cd ../src-openmp
+cd ../src-tampi
 make clean
 if [ $1 = "tampi" ]; then
     make tampi
