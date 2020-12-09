@@ -120,8 +120,10 @@ static void exchangeData(HaloExchange* haloExchange, void* data, int iAxis);
 static int* mkAtomCellList(LinkCell* boxes, enum HaloNeighbourOrder iFace, const int nCells);
 static int loadAtomsBuffer(void* vparms, void* data, int face, char* charBuf);
 static int loadAtomsBoxBuffer(void* vparms, void* data, int box, int face, char* charBuf);
+static int loadAtomsColumnBuffer(void* vparms, void* data, int x, int y, int neighbourAxis, char* charBuf);
+static int loadAtomsColumnEndBuffer(void* vparms, void* data, int x, int y, int end, int neighbourAxis, char* charBuf);
 static void unloadAtomsBuffer(void* vparms, void* data, int face, int bufSize, char* charBuf);
-static void unloadAtomsBoxBuffer(void* vparms, void* data, int face, int bufSize, char* charBuf);
+static void unloadAtomsBoxBuffer(void* vparms, void* data, int blank, int bufSize, char* charBuf);
 static void destroyAtomsExchange(void* vparms);
 
 static int* mkForceSendCellList(LinkCell* boxes, int face, int nCells);
@@ -179,11 +181,14 @@ HaloExchange* initAtomHaloExchange(Domain* domain, LinkCell* boxes)
    int size2 = (boxes->gridSize[0])*(boxes->gridSize[1]);
    int maxSize = MAX(size0, size1);
    maxSize = MAX(size1, size2);
+
    // Changed value for box by box communication
    //hh->bufCapacity = maxSize*2*MAXATOMS*sizeof(AtomMsg);
-   hh->bufCapacity = MAXATOMS*sizeof(AtomMsg);
+   hh->bufCapacity = (boxes->gridSize[2]+2)*MAXATOMS*sizeof(AtomMsg);
    
    hh->loadBoxBuffer = loadAtomsBoxBuffer;
+   hh->loadColumnBuffer = loadAtomsColumnBuffer;
+   hh->loadColumnEndBuffer = loadAtomsColumnEndBuffer;
    hh->unloadBoxBuffer= unloadAtomsBoxBuffer;
    hh->destroy = destroyAtomsExchange;
 
@@ -233,6 +238,8 @@ HaloExchange* initAtomHaloExchange(Domain* domain, LinkCell* boxes)
    }
    int* procCoord = domain->procCoord; //alias
    int* procGrid  = domain->procGrid; //alias
+   
+   // 26-way periodic boundary conditions
    if (procCoord[HALO_X_AXIS] == 0)
    {
        parms->pbcFactor[HALO_X_MINUS][HALO_X_AXIS]                 = +1.0;
@@ -399,113 +406,137 @@ void haloExchange(HaloExchange* haloExchange, void* data)
 
    // Allocate Memory
    // Separate set of send buffers for each box
-   char*** sendBufs = comdMalloc(ll->nCommBoxes*sizeof(char**));
+   char*** sendBufs = comdMalloc(ll->numColumns*sizeof(char**));
    // Separate set of send buffers for each box
-   char*** recvBufs = comdMalloc(ll->nCommBoxes*sizeof(char**));
+   char*** recvBufs = comdMalloc(ll->numColumns*sizeof(char**));
    // Separate set of send requests for each box
-   MPI_Request** sendRequests = comdMalloc(ll->nCommBoxes*sizeof(MPI_Request*));
+   MPI_Request** sendRequests = comdMalloc(ll->numColumns*sizeof(MPI_Request*));
    // Separate set of receive requests for each box
-   MPI_Request** recvRequests = comdMalloc(ll->nCommBoxes*sizeof(MPI_Request*));
+   MPI_Request** recvRequests = comdMalloc(ll->numColumns*sizeof(MPI_Request*));
    // Number of bytes to be sent for each box
-   int** nSends = comdMalloc(ll->nCommBoxes*sizeof(int*));
+   int** nSends = comdMalloc(ll->numColumns*sizeof(int*));
    // Number of bytes to be received from each neighbour
-   int** nRecvs = comdMalloc(ll->nCommBoxes*sizeof(int*));
+   int** nRecvs = comdMalloc(ll->numColumns*sizeof(int*));
    // Number of neighbours each box has
-   int* nNeighbours = comdMalloc(ll->nCommBoxes*sizeof(int));
-   for (int iCommBox=0; iCommBox<ll->nCommBoxes; ++iCommBox)
+   int* nColumnNeighbours = comdMalloc(ll->numColumns*sizeof(int));
+   for (int iColumn=0; iColumn<ll->numColumns; ++iColumn)
    {
        // Number of neighbours of the current box
-       nNeighbours[iCommBox] = ll->commBoxNumNeighbours[iCommBox];
+       nColumnNeighbours[iColumn] = ll->columnNumNeighbours[iColumn];
        // Different request for each neighbour
-       sendRequests[iCommBox] = comdMalloc(nNeighbours[iCommBox]*sizeof(MPI_Request));
+       sendRequests[iColumn] = comdMalloc(nColumnNeighbours[iColumn]*sizeof(MPI_Request));
        // Seperate number of bytes received from each neighbour
-       nSends[iCommBox] = comdMalloc(nNeighbours[iCommBox]*sizeof(int));
-       nRecvs[iCommBox] = comdMalloc(nNeighbours[iCommBox]*sizeof(int));
+       nSends[iColumn] = comdMalloc(nColumnNeighbours[iColumn]*sizeof(int));
+       nRecvs[iColumn] = comdMalloc(nColumnNeighbours[iColumn]*sizeof(int));
        // Different request for each neighbour
-       recvRequests[iCommBox] = comdMalloc(nNeighbours[iCommBox]*sizeof(MPI_Request));
+       recvRequests[iColumn] = comdMalloc(nColumnNeighbours[iColumn]*sizeof(MPI_Request));
 
        // Different send and receive buffer for each neighbour
-       sendBufs[iCommBox] = comdMalloc(nNeighbours[iCommBox]*sizeof(char*));
-       recvBufs[iCommBox] = comdMalloc(nNeighbours[iCommBox]*sizeof(char*));
-       for (int iBoxNeighbour=0; iBoxNeighbour<nNeighbours[iCommBox]; ++iBoxNeighbour)
+       sendBufs[iColumn] = comdMalloc(nColumnNeighbours[iColumn]*sizeof(char*));
+       recvBufs[iColumn] = comdMalloc(nColumnNeighbours[iColumn]*sizeof(char*));
+       for (int iColumnNeighbour=0; iColumnNeighbour<ll->columnNumNeighbours[iColumn]; ++iColumnNeighbour)
        {
            // Buffer capacity is preset
-           sendBufs[iCommBox][iBoxNeighbour] = comdMalloc(haloExchange->bufCapacity);
-           recvBufs[iCommBox][iBoxNeighbour] = comdMalloc(haloExchange->bufCapacity);
+           sendBufs[iColumn][iColumnNeighbour] = comdMalloc(haloExchange->bufCapacity);
+           recvBufs[iColumn][iColumnNeighbour] = comdMalloc(haloExchange->bufCapacity);
        }
    }
 
-   for (int iCommBox=0; iCommBox<ll->nCommBoxes; ++iCommBox)
+   // Load atoms into buffers
+   int iColumn = 0;
+   for (int x=-1;x<ll->gridSize[0]+1;++x)
    {
-       for (int iBoxNeighbour=0; iBoxNeighbour<nNeighbours[iCommBox]; ++iBoxNeighbour)
+       for (int y=-1;y<ll->gridSize[1]+1;++y)
        {
-          // Load atoms from box into buffer and return the number of atoms
-          nSends[iCommBox][iBoxNeighbour] = haloExchange->loadBoxBuffer(haloExchange->parms,
-                                                         data,
-                                                         ll->commBoxes[iCommBox],
-                                                         ll->commBoxNeighbours[iCommBox][iBoxNeighbour][1],
-                                                         sendBufs[iCommBox][iBoxNeighbour]);
+           for (int iColumnNeighbour=0; iColumnNeighbour<ll->columnNumNeighbours[iColumn]; ++iColumnNeighbour)
+           {
+               // If the neighbour has the same z coordinate, then we send the
+               // whole column. If not, we send the appropriate end
+               if (ll->columnNeighbours[iColumn][iColumnNeighbour][2] == 0)
+               {
+                   nSends[iColumn][iColumnNeighbour] = haloExchange->loadColumnBuffer(haloExchange->parms,
+                           data,
+                           x,
+                           y,
+                           ll->columnNeighbours[iColumn][iColumnNeighbour][1],
+                           sendBufs[iColumn][iColumnNeighbour]);
+               }
+               else
+               {
+                   nSends[iColumn][iColumnNeighbour] = haloExchange->loadColumnEndBuffer(haloExchange->parms,
+                           data,
+                           x,
+                           y,
+                           ll->columnNeighbours[iColumn][iColumnNeighbour][1],
+                           ll->columnNeighbours[iColumn][iColumnNeighbour][2],
+                           sendBufs[iColumn][iColumnNeighbour]);
+               }
+           }
+
+           ++iColumn;
        }
    }
 
-   for (int iCommBox=0; iCommBox<ll->nCommBoxes; ++iCommBox)
+   // Sends
+   for (iColumn=0; iColumn<ll->numColumns; ++iColumn)
+   {
+       // Issue non-blocking send to each column neighbour and return the MPI_Request
+       for (int iColumnNeighbour=0;iColumnNeighbour<nColumnNeighbours[iColumn];++iColumnNeighbour)
+       {
+           sendRequests[iColumn][iColumnNeighbour] = isendParallel(sendBufs[iColumn][iColumnNeighbour],
+                                                           nSends[iColumn][iColumnNeighbour],
+                                                           ll->columnNeighbours[iColumn][iColumnNeighbour][0]);
+       }
+   }
+
+   // Receives
+   for (iColumn=0; iColumn<ll->numColumns; ++iColumn)
    {
        // Issue non-blocking send to each neighbour and return the MPI_Request
-       for (int iBoxNeighbour=0;iBoxNeighbour<nNeighbours[iCommBox];++iBoxNeighbour)
+       for (int iColumnNeighbour=0;iColumnNeighbour<nColumnNeighbours[iColumn];++iColumnNeighbour)
        {
-           sendRequests[iCommBox][iBoxNeighbour] = isendParallel(sendBufs[iCommBox][iBoxNeighbour],
-                                                           nSends[iCommBox][iBoxNeighbour],
-                                                           ll->commBoxNeighbours[iCommBox][iBoxNeighbour][0]);
-       }
-   }
-
-   for (int iCommBox=0; iCommBox<ll->nCommBoxes; ++iCommBox)
-   {
-       // Issue non-blocking receive to each neighbour and return the MPI_Request
-       for (int iBoxNeighbour=0; iBoxNeighbour<nNeighbours[iCommBox]; ++iBoxNeighbour)
-       {
-           recvRequests[iCommBox][iBoxNeighbour] = irecvParallel(recvBufs[iCommBox][iBoxNeighbour],
+           recvRequests[iColumn][iColumnNeighbour] = irecvParallel(recvBufs[iColumn][iColumnNeighbour],
                                                            haloExchange->bufCapacity,
-                                                           ll->commBoxNeighbours[iCommBox][iBoxNeighbour][0]);
+                                                           ll->columnNeighbours[iColumn][iColumnNeighbour][0]);
        }
    }
 
-   for (int iCommBox=0; iCommBox<ll->nCommBoxes; ++iCommBox)
+   // Waits for receives and unloads
+   for (iColumn=0; iColumn<ll->numColumns; ++iColumn)
    {
-       // Wait for receives and unload buffers
-       for (int iBoxNeighbour=0; iBoxNeighbour<nNeighbours[iCommBox]; ++iBoxNeighbour)
+       for (int iColumnNeighbour=0; iColumnNeighbour<nColumnNeighbours[iColumn]; ++iColumnNeighbour)
        {
-           nRecvs[iCommBox][iBoxNeighbour] = waitRecvParallel(recvRequests[iCommBox][iBoxNeighbour]);
+           nRecvs[iColumn][iColumnNeighbour] = waitRecvParallel(recvRequests[iColumn][iColumnNeighbour]);
            haloExchange->unloadBoxBuffer(haloExchange->parms,
                                          data,
-                                         ll->commBoxes[iCommBox],
-                                         nRecvs[iCommBox][iBoxNeighbour],
-                                         recvBufs[iCommBox][iBoxNeighbour]);
+                                         0,
+                                         nRecvs[iColumn][iColumnNeighbour],
+                                         recvBufs[iColumn][iColumnNeighbour]);
        }
    }
 
-   for (int iCommBox=0; iCommBox<ll->nCommBoxes; ++iCommBox)
+   // Waits for sends
+   for (iColumn=0; iColumn<ll->numColumns; ++iColumn)
    {
-       for (int iBoxNeighbour=0; iBoxNeighbour<nNeighbours[iCommBox]; ++iBoxNeighbour)
+       for (int iColumnNeighbour=0; iColumnNeighbour<nColumnNeighbours[iColumn]; ++iColumnNeighbour)
        {
-           // Wait for sends
-           waitSendParallel(sendRequests[iCommBox][iBoxNeighbour]);
+           waitSendParallel(sendRequests[iColumn][iColumnNeighbour]);
        }
    }
 
    // Free everything
-   for (int iCommBox=0; iCommBox<ll->nCommBoxes; ++iCommBox)
+   for (iColumn=0; iColumn<ll->numColumns; ++iColumn)
    {
-       for (int iBoxNeighbour=0; iBoxNeighbour<nNeighbours[iCommBox]; ++iBoxNeighbour)
+       for (int iColumnNeighbour=0; iColumnNeighbour<nColumnNeighbours[iColumn]; ++iColumnNeighbour)
        {
-           comdFree(recvBufs[iCommBox][iBoxNeighbour]);
-           comdFree(sendBufs[iCommBox][iBoxNeighbour]);
+           comdFree(recvBufs[iColumn][iColumnNeighbour]);
+           comdFree(sendBufs[iColumn][iColumnNeighbour]);
        }
-       comdFree(sendRequests[iCommBox]);
-       comdFree(sendBufs[iCommBox]);
-       comdFree(recvBufs[iCommBox]);
-       comdFree(recvRequests[iCommBox]);
-       comdFree(nRecvs[iCommBox]);
+       comdFree(sendRequests[iColumn]);
+       comdFree(sendBufs[iColumn]);
+       comdFree(recvBufs[iColumn]);
+       comdFree(recvRequests[iColumn]);
+       comdFree(nRecvs[iColumn]);
    }
    comdFree(sendBufs);
    comdFree(recvBufs);
@@ -513,7 +544,7 @@ void haloExchange(HaloExchange* haloExchange, void* data)
    comdFree(recvRequests);
    comdFree(nSends);
    comdFree(nRecvs);
-   comdFree(nNeighbours);
+   comdFree(nColumnNeighbours);
 }
 
 /// Base class constructor.
@@ -580,113 +611,8 @@ void exchangeData(HaloExchange* haloExchange, void* data, int neighbour)
    
    haloExchange->unloadBuffer(haloExchange->parms, data, target, nRecv, recvBuf);
 
-   //int testrank;
-   //if (MPI_Comm_rank(MPI_COMM_WORLD,&testrank)==target)
-   //{
-   //    if(memcmp(buf,buf2,nRecv) != 0)
-   //     {
-   //         printf("not matching\n");
-   //         assert(nSend == nRecv);
-   //         
-   //         for (int ii=0; ii<nRecv/sizeof(AtomMsg); ++ii)
-   //         {
-   //             if(buf[ii].gid != buf2[ii].gid)
-   //             {
-   //                 printf("gid_sent = %i\tgid_recv = %i\n",buf[ii].gid,buf2[ii].gid);
-   //             }
-   //             if(buf[ii].type != buf2[ii].type)
-   //             {
-   //                 printf("type_sent = %i\ttype_recv = %i\n",buf[ii].type,buf2[ii].type);
-   //             }
-   //             if(buf[ii].rx != buf2[ii].rx)
-   //             {
-   //                 printf("rx_sent = %lf\trx_recv = %lf\n",buf[ii].rx,buf2[ii].rx);
-   //             }
-   //             if(buf[ii].ry != buf2[ii].ry)
-   //             {
-   //                 printf("ry_sent = %lf\try_recv = %lf\n",buf[ii].ry,buf2[ii].ry);
-   //             }
-   //             if(buf[ii].rz != buf2[ii].rz)
-   //             {
-   //                 printf("rz_sent = %lf\trz_recv = %lf\n",buf[ii].rz,buf2[ii].rz);
-   //             }
-   //             if(buf[ii].px != buf2[ii].px)
-   //             {
-   //                 printf("px_sent = %lf\tpx_recv = %lf\n",buf[ii].px,buf2[ii].px);
-   //             }
-   //             if(buf[ii].py != buf2[ii].py)
-   //             {
-   //                 printf("py_sent = %lf\tpy_recv = %lf\n",buf[ii].py,buf2[ii].py);
-   //             }
-   //             if(buf[ii].pz != buf2[ii].pz)
-   //             {
-   //                 printf("pz_sent = %lf\tpz_recv = %lf\n\n",buf[ii].pz,buf2[ii].pz);
-   //             }
-   //         }
-   //     }
-   //    else
-   //    {
-   //         printf("matching\n");
-   //    }
-   //}   
-
-   //else
-   //{
-   //    char* recvBuf2 = comdMalloc(haloExchange->bufCapacity);
-   //    nRecv = sendReceiveParallel(recvBuf, nRecv, nbrRank, recvBuf2, haloExchange->bufCapacity, nbrRank);
-   //    AtomMsg* buf3 = (AtomMsg*) recvBuf2;
-   //    assert(nRecv % sizeof(AtomMsg) == 0);
-
-   //    if(memcmp(buf,buf3,nRecv) != 0)
-   //     {
-   //         printf("not matching\n");
-   //         assert(nSend == nRecv);
-   //         
-   //         for (int ii=0; ii<nRecv/sizeof(AtomMsg); ++ii)
-   //         {
-   //             if(buf[ii].gid != buf3[ii].gid)
-   //             {
-   //                 printf("gid_sent = %i\tgid_recv = %i\n",buf[ii].gid,buf3[ii].gid);
-   //             }
-   //             if(buf[ii].type != buf3[ii].type)
-   //             {
-   //                 printf("type_sent = %i\ttype_recv = %i\n",buf[ii].type,buf3[ii].type);
-   //             }
-   //             if(buf[ii].rx != buf3[ii].rx)
-   //             {
-   //                 printf("rx_sent = %lf\trx_recv = %lf\n",buf[ii].rx,buf3[ii].rx);
-   //             }
-   //             if(buf[ii].ry != buf3[ii].ry)
-   //             {
-   //                 printf("ry_sent = %lf\try_recv = %lf\n",buf[ii].ry,buf3[ii].ry);
-   //             }
-   //             if(buf[ii].rz != buf3[ii].rz)
-   //             {
-   //                 printf("rz_sent = %lf\trz_recv = %lf\n",buf[ii].rz,buf3[ii].rz);
-   //             }
-   //             if(buf[ii].px != buf3[ii].px)
-   //             {
-   //                 printf("px_sent = %lf\tpx_recv = %lf\n",buf[ii].px,buf3[ii].px);
-   //             }
-   //             if(buf[ii].py != buf3[ii].py)
-   //             {
-   //                 printf("py_sent = %lf\tpy_recv = %lf\n",buf[ii].py,buf3[ii].py);
-   //             }
-   //             if(buf[ii].pz != buf3[ii].pz)
-   //             {
-   //                 printf("pz_sent = %lf\tpz_recv = %lf\n\n",buf[ii].pz,buf3[ii].pz);
-   //             }
-   //         }
-   //     }
-   //    else
-   //    {
-   //         printf("matching\n");
-   //    }
-   //}
-
    comdFree(recvBuf);
    comdFree(sendBuf);
-   
 }
 
 /// Make a list of link cells that need to be sent across the specified
@@ -983,13 +909,13 @@ int* mkAtomCellList(LinkCell* boxes, enum HaloNeighbourOrder iFace, const int nC
 }
 
 // Load atoms from a single box into a buffer
-int loadAtomsBoxBuffer(void* vparms, void* data, int box, int face, char* charBuf)
+int loadAtomsBoxBuffer(void* vparms, void* data, int box, int neighbourAxis, char* charBuf)
 {
    AtomExchangeParms* parms = (AtomExchangeParms*) vparms;
    SimFlat* s = (SimFlat*) data;
    AtomMsg* buf = (AtomMsg*) charBuf;
    
-   real_t* pbcFactor = parms->pbcFactor[face];
+   real_t* pbcFactor = parms->pbcFactor[neighbourAxis];
    real3 shift;
 
    shift[0] = pbcFactor[0] * s->domain->globalExtent[0];
@@ -1015,7 +941,7 @@ int loadAtomsBoxBuffer(void* vparms, void* data, int box, int face, char* charBu
 
 // Load atoms from a buffer into a single box
 // This is the same as the original code for now
-void unloadAtomsBoxBuffer(void* vparms, void* data, int box, int bufSize, char* charBuf)
+void unloadAtomsBoxBuffer(void* vparms, void* data, int blank, int bufSize, char* charBuf)
 {
    AtomExchangeParms* parms = (AtomExchangeParms*) vparms;
    SimFlat* s = (SimFlat*) data;
@@ -1036,6 +962,91 @@ void unloadAtomsBoxBuffer(void* vparms, void* data, int box, int bufSize, char* 
       putAtomInBox(s->boxes, s->atoms, gid, type, rx, ry, rz, px, py, pz);
    }
 }
+
+// Load atoms from a column of boxes into a single buffer
+int loadAtomsColumnBuffer(void* vparms, void* data, int x, int y, int neighbourAxis, char* charBuf)
+{
+   AtomExchangeParms* parms = (AtomExchangeParms*) vparms;
+   SimFlat* s = (SimFlat*) data;
+   AtomMsg* buf = (AtomMsg*) charBuf;
+   
+   real_t* pbcFactor = parms->pbcFactor[neighbourAxis];
+   real3 shift;
+
+   shift[0] = pbcFactor[0] * s->domain->globalExtent[0];
+   shift[1] = pbcFactor[1] * s->domain->globalExtent[1];
+   shift[2] = pbcFactor[2] * s->domain->globalExtent[2];
+
+   int nCells = s->boxes->gridSize[2];
+   int nBuf=0;
+
+   for (int iCell=-1; iCell<nCells+1; ++iCell)
+   {
+       int box = getBoxFromTuple(s->boxes,x,y,iCell);
+       int iOff = box*MAXATOMS;
+       for (int ii=iOff; ii<iOff+s->boxes->nAtoms[box]; ++ii)
+       {
+          buf[nBuf].gid  = s->atoms->gid[ii];
+          buf[nBuf].type = s->atoms->iSpecies[ii];
+          buf[nBuf].rx = s->atoms->r[ii][0] + shift[0];
+          buf[nBuf].ry = s->atoms->r[ii][1] + shift[1];
+          buf[nBuf].rz = s->atoms->r[ii][2] + shift[2];
+          buf[nBuf].px = s->atoms->p[ii][0];
+          buf[nBuf].py = s->atoms->p[ii][1];
+          buf[nBuf].pz = s->atoms->p[ii][2];
+          ++nBuf;
+       }
+   }
+   return nBuf*sizeof(AtomMsg);
+}
+
+// Load the atoms from the two boxes at either the start or end of a column into
+// a single buffer
+int loadAtomsColumnEndBuffer(void* vparms, void* data, int x, int y, int neighbourAxis, int end, char* charBuf)
+{
+   AtomExchangeParms* parms = (AtomExchangeParms*) vparms;
+   SimFlat* s = (SimFlat*) data;
+   AtomMsg* buf = (AtomMsg*) charBuf;
+   
+   real_t* pbcFactor = parms->pbcFactor[neighbourAxis];
+   real3 shift;
+
+   shift[0] = pbcFactor[0] * s->domain->globalExtent[0];
+   shift[1] = pbcFactor[1] * s->domain->globalExtent[1];
+   shift[2] = pbcFactor[2] * s->domain->globalExtent[2];
+
+   int cellStart;
+   if (end == -1)
+   {
+       cellStart = -1;
+   }
+   else if (end == 1)
+   {
+       cellStart = s->boxes->gridSize[2] - 1;
+   }
+    int nBuf=0;
+
+   for (int iCell=cellStart; iCell<cellStart+2; ++iCell)
+   {
+       int box = getBoxFromTuple(s->boxes,x,y,iCell);
+       int iOff = box*MAXATOMS;
+       for (int ii=iOff; ii<iOff+s->boxes->nAtoms[box]; ++ii)
+       {
+          buf[nBuf].gid  = s->atoms->gid[ii];
+          buf[nBuf].type = s->atoms->iSpecies[ii];
+          buf[nBuf].rx = s->atoms->r[ii][0] + shift[0];
+          buf[nBuf].ry = s->atoms->r[ii][1] + shift[1];
+          buf[nBuf].rz = s->atoms->r[ii][2] + shift[2];
+          buf[nBuf].px = s->atoms->p[ii][0];
+          buf[nBuf].py = s->atoms->p[ii][1];
+          buf[nBuf].pz = s->atoms->p[ii][2];
+          ++nBuf;
+       }
+   }
+   return nBuf*sizeof(AtomMsg);
+}
+
+
 
 /// The loadBuffer function for a halo exchange of atom data.  Iterates
 /// link cells in the cellList and load any atoms into the send buffer.

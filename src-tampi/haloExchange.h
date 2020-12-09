@@ -71,7 +71,9 @@ typedef struct HaloExchangeSt
 
    // New additions
    int  (*loadBoxBuffer)(void* parms, void* data, int box, int face, char* buf);
-   void (*unloadBoxBuffer)(void* parms, void* data, int face, int bufSize, char* buf);
+   int  (*loadColumnBuffer)(void* parms, void* data, int x, int y, int neighbourAxis, char* buf);
+   int  (*loadColumnEndBuffer)(void* parms, void* data, int x, int y, int end, int neighbourAxis, char* buf);
+   void (*unloadBoxBuffer)(void* parms, void* data, int blank, int bufSize, char* buf);
 } 
 HaloExchange;
 

@@ -5,6 +5,7 @@
 #define __LINK_CELLS_H_
 
 #include "mytype.h"
+#include "initAtoms.h"
 
 /// The maximum number of atoms that can be stored in a link cell.
 #define MAXATOMS 64 
@@ -30,13 +31,11 @@ typedef struct LinkCellSt
    int** nbrBoxes;            //!< neighbor boxes for each box
 
    // New additions
-   int nCommBoxes;            //!< number of boxes involved in communication
-                              //!< nHaloBoxes + outer layer of local boxes
-   int* commBoxes;            //!< list of boxes involved in communication
-   int*** commBoxNeighbours;   //!< list of ranks of neighbours of each box
-   int** neighbourTags;       //!< 
-   int* commBoxNumNeighbours; //!< number of neighbours of each communication box
    int* faces;                //!< index of the face each box is located on
+   int numColumns;            //!< number of columns
+   int* columnNumNeighbours;  //!< number of neighbours of each column
+   int*** columnNeighbours;   //!< neighbours of each column
+   Atoms** pendingAtoms;         //!< atoms that are due to be transferred to the given column
 
 } LinkCell;
 

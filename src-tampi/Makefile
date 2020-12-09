@@ -15,9 +15,9 @@ DO_MPI = ON
 ### specify paths to include files that the compiler can't find on its
 ### own.  If you need any -L or -l switches to get C standard libraries
 ### (such as -lm for the math library) put them in C_LIB.
-CC = cc
-CFLAGS = -fopenmp
-OPTFLAGS = 
+CC = mpicc
+CFLAGS = -std=c99 -fopenmp
+OPTFLAGS = -O5
 INCLUDES = 
 C_LIB = -lm
 
